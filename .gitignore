@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.env
+backend/trader/state/
+backend/trader/*.json
+!backend/trader/config.json
+
+# Node
+node_modules/
+frontend/dist/
+
+# Docker
+.docker/
