@@ -5,21 +5,21 @@
 //+------------------------------------------------------------------+
 #property copyright   "Quantitative EA Dev"
 #property link        "https://trade.local"
-#property version     "3.10"
+#property version     "3.20"
 #property description "FULL AUTO: Single One-Way Ratchet Trailing Limit EA with Q-Learning AI"
-#property description "Hanya 1 Limit Order (Buy Limit ATAU Sell Limit). Trailing Searah (Ratchet)."
+#property description "Auto Diagnostics: Auto Filling Mode, Broker StopLevel Compliance, Live Logging"
 
 #include <Trade\Trade.mqh>
 CTrade trade;
 
 //====================================================================
-//--- ENUM MODE AUTO-START (HANYA 1 ORDER, TIDAK PERNAH KEDUANYA)
+//--- ENUM MODE AUTO-START (HANYA 1 ORDER TUNGGAL)
 //====================================================================
 enum ENUM_AUTO_START_MODE
 {
-   AUTO_AI_MARKET_CHOICE = 0, // AI / Indikator Memilih 1 Arah Saja (RSI Overbought=Sell Limit, Oversold=Buy Limit)
-   AUTO_ONLY_BUY_LIMIT   = 1, // HANYA Pasang 1 Buy Limit (Mencari Dasar Pantulan)
-   AUTO_ONLY_SELL_LIMIT  = 2  // HANYA Pasang 1 Sell Limit (Mencari Pucuk Pantulan)
+   AUTO_AI_MARKET_CHOICE = 0, // AI / RSI Memilih 1 Arah Saja (RSI >= 50: Sell Limit, RSI < 50: Buy Limit)
+   AUTO_ONLY_BUY_LIMIT   = 1, // HANYA Pasang 1 Buy Limit
+   AUTO_ONLY_SELL_LIMIT  = 2  // HANYA Pasang 1 Sell Limit
 };
 
 //====================================================================
@@ -27,7 +27,7 @@ enum ENUM_AUTO_START_MODE
 //====================================================================
 sinput string               Section_Auto         = "====== SISTEM OTOMATIS (TUNGGAL) ======";
 input ENUM_AUTO_START_MODE  InpAutoStartMode     = AUTO_AI_MARKET_CHOICE; // Pilihan 1 Order Pertama
-input int                   InpCooldownSeconds   = 5;                     // Jeda Detik Sebelum Siklus Baru
+input int                   InpCooldownSeconds   = 3;                     // Jeda Detik Sebelum Siklus Baru
 
 sinput string               Section_Trading      = "====== PENGATURAN ORDER ======";
 input double                InpLotSize           = 0.01;                  // Ukuran Lot
@@ -46,7 +46,7 @@ input bool                  InpEnableAI          = true;                  // Akt
 input int                   InpATRPeriod         = 14;                    // Periode ATR (Mengukur Volatilitas)
 input int                   InpRSIPeriod         = 14;                    // Periode RSI (Mengukur Momentum)
 input double                InpLearningRate      = 0.15;                  // Learning Rate (Alpha: 0.05 - 0.3)
-input double                InpExplorationRate   = 0.10;                  // Exploration Rate (Epsilon: 10% peluang coba jarak baru)
+input double                InpExplorationRate   = 0.10;                  // Exploration Rate (Epsilon: 10% coba jarak baru)
 
 //====================================================================
 //--- VARIABEL GLOBAL & MATRIKS Q-LEARNING
@@ -61,10 +61,44 @@ int      lastState              = 1;
 int      lastAction             = 1;
 double   currentDynamicDistance = 200.0;
 datetime lastCycleCloseTime     = 0;
+string   lastDiagnosisMsg       = "Normal";
 
 int    handleATR = INVALID_HANDLE;
 int    handleRSI = INVALID_HANDLE;
 string memoryFile = "Ratchet_AI_Memory_" + _Symbol + ".bin";
+
+//+------------------------------------------------------------------+
+//| Auto-Detect Filling Mode yang didukung Broker                    |
+//+------------------------------------------------------------------+
+void SetProperFillingMode()
+{
+   uint filling = (uint)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   if((filling & SYMBOL_FILLING_FOK) != 0)
+      trade.SetTypeFilling(ORDER_FILLING_FOK);
+   else if((filling & SYMBOL_FILLING_IOC) != 0)
+      trade.SetTypeFilling(ORDER_FILLING_IOC);
+   else
+      trade.SetTypeFilling(ORDER_FILLING_RETURN);
+}
+
+//+------------------------------------------------------------------+
+//| Normalisasi Ukuran Lot Sesuai Aturan Broker                      |
+//+------------------------------------------------------------------+
+double SanitizeLot(double requestedLot)
+{
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(minLot <= 0.0) minLot = 0.01;
+   if(stepLot <= 0.0) stepLot = 0.01;
+
+   double lot = MathMax(requestedLot, minLot);
+   if(maxLot > 0.0) lot = MathMin(lot, maxLot);
+
+   lot = MathFloor(lot / stepLot) * stepLot;
+   return NormalizeDouble(lot, 2);
+}
 
 //+------------------------------------------------------------------+
 //| Expert Initialization Function                                   |
@@ -73,7 +107,7 @@ int OnInit()
 {
    trade.SetExpertMagicNumber(InpMagicNumber);
    trade.SetDeviationInPoints(InpSlippagePoints);
-   trade.SetTypeFillingBySymbol(_Symbol);
+   SetProperFillingMode();
 
    handleATR = iATR(_Symbol, _Period, InpATRPeriod);
    handleRSI = iRSI(_Symbol, _Period, InpRSIPeriod, PRICE_CLOSE);
@@ -86,7 +120,7 @@ int OnInit()
 
    LoadAIMemory();
 
-   Print("[INFO] Ratchet AI Trader FULL AUTO (SINGLE LIMIT) Aktif pada ", _Symbol);
+   Print("[INFO] Ratchet AI Trader FULL AUTO v3.20 Berhasil Dimuat pada ", _Symbol);
    return(INIT_SUCCEEDED);
 }
 
@@ -104,12 +138,39 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   // 1. DIAGNOSA KESIAPAN TRADING OTOMATIS
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+   {
+      lastDiagnosisMsg = "PERINGATAN: Tombol Algo Trading di Toolbar MT5 masih NONAKTIF (Merah)! Silakan KLIK tombol Algo Trading agar HIJAU.";
+      UpdateDashboard(0, 0, 0);
+      return;
+   }
+   if(!MqlInfoInteger(MQL_TRADE_ALLOWED))
+   {
+      lastDiagnosisMsg = "PERINGATAN: Opsi 'Allow Algo Trading' pada Tab Common EA belum dicentang! Tekan F7 di chart lalu centang.";
+      UpdateDashboard(0, 0, 0);
+      return;
+   }
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
+   {
+      lastDiagnosisMsg = "PERINGATAN: Akun ini tidak diizinkan trading oleh broker (Cek password investor/read-only).";
+      UpdateDashboard(0, 0, 0);
+      return;
+   }
+
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
 
-   // StopLevel compliance
+   if(ask <= 0.0 || bid <= 0.0)
+   {
+      lastDiagnosisMsg = "Menunggu kuotasi harga Ask/Bid dari broker...";
+      UpdateDashboard(0, 0, 0);
+      return;
+   }
+
+   // StopLevel compliance (Jarak minimal pending order)
    long stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
    double minDistanceRequired = (stopLevel > 0) ? (double)stopLevel : (double)InpLimitDistanceMin;
    if(minDistanceRequired < (double)InpLimitDistanceMin)
@@ -119,41 +180,55 @@ void OnTick()
    int pendingOrders   = CountPendingOrders();
    double currentBasketProfit = CalculateBasketProfit();
 
-   // 1. MONITOR TARGET PROFIT & EMERGENCY CUTOFF
+   // 2. MONITOR BASKET PROFIT & DRAWDOWN
    if(activePositions > 0)
    {
-      // Target Profit Basket Tercapai -> Close All & Re-learn
       if(currentBasketProfit >= InpTargetProfitUSD)
       {
-         Print("[PROFIT] Target Profit Tercapai: +$", DoubleToString(currentBasketProfit, 2), " -> Tutup Semua Posisi.");
+         Print("[PROFIT] Target Basket Profit Tercapai: +$", DoubleToString(currentBasketProfit, 2), " -> Tutup Semua Posisi.");
          CloseAllPositionsAndOrders();
          UpdateAILearning(1.0);
          lastCycleCloseTime = TimeCurrent();
+         lastDiagnosisMsg = "Basket Profit Tercapai! Menutup semua posisi.";
          return;
       }
 
-      // Hard Drawdown Cutoff Tercapai -> Emergency Cut Loss
       if(currentBasketProfit <= -InpMaxDrawdownUSD)
       {
          Print("[EMERGENCY] Max Drawdown Tercapai: -$", DoubleToString(currentBasketProfit, 2), " -> Cut Loss Darurat!");
          CloseAllPositionsAndOrders();
          UpdateAILearning(-1.5);
          lastCycleCloseTime = TimeCurrent();
+         lastDiagnosisMsg = "Max Drawdown Tersentuh! Cut Loss darurat dilakukan.";
          return;
       }
    }
 
-   // 2. OTOMATISASI INITIAL ENTRY: HANYA PASANG 1 PENDING ORDER
-   // Hanya pasang jika TIDAK ADA posisi aktif DAN TIDAK ADA pending order sama sekali
+   // 3. AUTO INITIAL ENTRY: PASANG HANYA 1 LIMIT ORDER
    if(activePositions == 0 && pendingOrders == 0)
    {
       if(TimeCurrent() - lastCycleCloseTime >= InpCooldownSeconds)
       {
+         lastDiagnosisMsg = "Menganalisis pasar & memasang 1 Pending Order perdana...";
          ExecuteSingleInitialLimit(ask, bid, point, digits, minDistanceRequired);
       }
+      else
+      {
+         lastDiagnosisMsg = StringFormat("Jeda Cooldown (%d detik tersisa)...", 
+                                        InpCooldownSeconds - (int)(TimeCurrent() - lastCycleCloseTime));
+      }
+   }
+   else if(activePositions > 0)
+   {
+      lastDiagnosisMsg = StringFormat("Posisi Berjalan (%d aktif) | Memantau Basket TP +$%.2f", 
+                                     activePositions, InpTargetProfitUSD);
+   }
+   else if(pendingOrders > 0)
+   {
+      lastDiagnosisMsg = "Menunggu Pending Limit tersentuh harga...";
    }
 
-   // 3. LOGIKA RATCHET TRAILING PENDING ORDER (Hanya 1 order yang berjalan)
+   // 4. LOGIKA RATCHET TRAILING SATU ARAH
    for(int i = OrdersTotal() - 1; i >= 0; i--)
    {
       ulong ticket = OrderGetTicket(i);
@@ -172,7 +247,10 @@ void OnTick()
 
                if(newTargetPrice < (currentPrice - (InpTrailingStep * point)))
                {
-                  trade.OrderModify(ticket, newTargetPrice, 0, 0, ORDER_TIME_GTC, 0);
+                  if(!trade.OrderModify(ticket, newTargetPrice, 0, 0, ORDER_TIME_GTC, 0))
+                  {
+                     Print("[WARN] Gagal geser Buy Limit! Retcode: ", trade.ResultRetcode(), " (", trade.ResultRetcodeDescription(), ")");
+                  }
                }
             }
 
@@ -184,24 +262,30 @@ void OnTick()
 
                if(newTargetPrice > (currentPrice + (InpTrailingStep * point)))
                {
-                  trade.OrderModify(ticket, newTargetPrice, 0, 0, ORDER_TIME_GTC, 0);
+                  if(!trade.OrderModify(ticket, newTargetPrice, 0, 0, ORDER_TIME_GTC, 0))
+                  {
+                     Print("[WARN] Gagal geser Sell Limit! Retcode: ", trade.ResultRetcode(), " (", trade.ResultRetcodeDescription(), ")");
+                  }
                }
             }
          }
       }
    }
 
-   // 4. Update Dashboard Tampilan di Chart
+   // 5. Update Dashboard Tampilan di Chart
    UpdateDashboard(currentBasketProfit, activePositions, pendingOrders);
 }
 
 //+------------------------------------------------------------------+
-//| Pasang HANYA SATU Pending Order di Awal (Bukan Keduanya)         |
+//| Pasang HANYA SATU Pending Order di Awal                          |
 //+------------------------------------------------------------------+
 void ExecuteSingleInitialLimit(double ask, double bid, double point, int digits, double minDistanceRequired)
 {
    currentDynamicDistance = InpEnableAI ? CalculateAIDistance() : InpLimitDistanceMin;
    double effectiveDist = MathMax(currentDynamicDistance, minDistanceRequired);
+   double lot = SanitizeLot(InpLotSize);
+
+   SetProperFillingMode();
 
    switch(InpAutoStartMode)
    {
@@ -209,21 +293,36 @@ void ExecuteSingleInitialLimit(double ask, double bid, double point, int digits,
       {
          double rsi[1];
          ArraySetAsSeries(rsi, true);
-         CopyBuffer(handleRSI, 0, 0, 1, rsi);
+         int copied = CopyBuffer(handleRSI, 0, 0, 1, rsi);
 
-         // Jika RSI >= 50: Pasar di atas, HANYA pasang 1 Sell Limit di atas pucuk
-         // Jika RSI < 50:  Pasar di bawah, HANYA pasang 1 Buy Limit di dasar lembah
-         if(rsi[0] >= 50.0)
+         // Jika RSI belum siap, gunakan default 50
+         double rsiVal = (copied > 0) ? rsi[0] : 50.0;
+
+         if(rsiVal >= 50.0)
          {
             double sellPrice = NormalizeDouble(bid + (effectiveDist * point), digits);
-            trade.SellLimit(InpLotSize, sellPrice, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "Initial Sell Limit");
-            Print("[INITIAL ENTRY] Pasar cenderung Naik (RSI ", DoubleToString(rsi[0], 1), ") -> HANYA pasang 1 Sell Limit di ", sellPrice);
+            if(trade.SellLimit(lot, sellPrice, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "Initial Sell Limit"))
+            {
+               Print("[BERHASIL] 1 Sell Limit dipasang di ", sellPrice, " | RSI: ", DoubleToString(rsiVal, 1));
+            }
+            else
+            {
+               Print("[GAGAL PASANG SELL LIMIT] Retcode: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+               lastDiagnosisMsg = "Order Gagal: " + trade.ResultRetcodeDescription();
+            }
          }
          else
          {
             double buyPrice = NormalizeDouble(ask - (effectiveDist * point), digits);
-            trade.BuyLimit(InpLotSize, buyPrice, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "Initial Buy Limit");
-            Print("[INITIAL ENTRY] Pasar cenderung Turun (RSI ", DoubleToString(rsi[0], 1), ") -> HANYA pasang 1 Buy Limit di ", buyPrice);
+            if(trade.BuyLimit(lot, buyPrice, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "Initial Buy Limit"))
+            {
+               Print("[BERHASIL] 1 Buy Limit dipasang di ", buyPrice, " | RSI: ", DoubleToString(rsiVal, 1));
+            }
+            else
+            {
+               Print("[GAGAL PASANG BUY LIMIT] Retcode: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+               lastDiagnosisMsg = "Order Gagal: " + trade.ResultRetcodeDescription();
+            }
          }
          break;
       }
@@ -231,16 +330,30 @@ void ExecuteSingleInitialLimit(double ask, double bid, double point, int digits,
       case AUTO_ONLY_BUY_LIMIT:
       {
          double buyPrice = NormalizeDouble(ask - (effectiveDist * point), digits);
-         trade.BuyLimit(InpLotSize, buyPrice, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "Initial Buy Limit");
-         Print("[INITIAL ENTRY] HANYA pasang 1 Buy Limit di ", buyPrice);
+         if(trade.BuyLimit(lot, buyPrice, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "Initial Buy Limit"))
+         {
+            Print("[BERHASIL] 1 Buy Limit dipasang di ", buyPrice);
+         }
+         else
+         {
+            Print("[GAGAL PASANG BUY LIMIT] Retcode: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+            lastDiagnosisMsg = "Order Gagal: " + trade.ResultRetcodeDescription();
+         }
          break;
       }
 
       case AUTO_ONLY_SELL_LIMIT:
       {
          double sellPrice = NormalizeDouble(bid + (effectiveDist * point), digits);
-         trade.SellLimit(InpLotSize, sellPrice, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "Initial Sell Limit");
-         Print("[INITIAL ENTRY] HANYA pasang 1 Sell Limit di ", sellPrice);
+         if(trade.SellLimit(lot, sellPrice, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "Initial Sell Limit"))
+         {
+            Print("[BERHASIL] 1 Sell Limit dipasang di ", sellPrice);
+         }
+         else
+         {
+            Print("[GAGAL PASANG SELL LIMIT] Retcode: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+            lastDiagnosisMsg = "Order Gagal: " + trade.ResultRetcodeDescription();
+         }
          break;
       }
    }
@@ -262,14 +375,12 @@ void OnTradeTransaction(const MqlTradeTransaction& trans, const MqlTradeRequest&
 
          if(magic == InpMagicNumber && symbol == _Symbol && entry == DEAL_ENTRY_IN)
          {
-            // Cek batas maksimal posisi (Max Layers)
             if(CountActivePositions() >= InpMaxPositions)
             {
                Print("[WARNING] Batas Max Posisi (", InpMaxPositions, ") tercapai. Menahan limit baru.");
                return;
             }
 
-            // Pastikan tidak ada pending order lain (selalu strictly 1 pending order)
             if(CountPendingOrders() > 0)
                return;
 
@@ -283,22 +394,35 @@ void OnTradeTransaction(const MqlTradeTransaction& trans, const MqlTradeRequest&
             long stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
             double effectiveDist = MathMax(currentDynamicDistance, (double)stopLevel);
             effectiveDist = MathMax(effectiveDist, (double)InpLimitDistanceMin);
+            double lot = SanitizeLot(InpLotSize);
 
-            // KASUS 1: Order SELL LIMIT kena -> Sekarang posisi SELL aktif.
-            // Respons EA: Pasang HANYA 1 BUY LIMIT di bawah yang HANYA IKUT TURUN (tidak ikut naik).
+            SetProperFillingMode();
+
+            // POSISI SELL AKTIF -> Pasang HANYA 1 Buy Limit di bawah yang hanya boleh geser turun
             if(dealType == DEAL_TYPE_SELL)
             {
                double targetPrice = NormalizeDouble(ask - (effectiveDist * point), digits);
-               trade.BuyLimit(InpLotSize, targetPrice, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "Ratchet Buy Limit");
-               Print("[RATCHET LIMIT] Posisi SELL aktif -> Pasang HANYA 1 Buy Limit di ", targetPrice, " (hanya ikut turun)");
+               if(trade.BuyLimit(lot, targetPrice, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "Ratchet Buy Limit"))
+               {
+                  Print("[ORDER RATCHET] Posisi SELL aktif -> Pasang Buy Limit di ", targetPrice, " (Hanya ikut turun)");
+               }
+               else
+               {
+                  Print("[GAGAL PASANG RATCHET BUY LIMIT] Retcode: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+               }
             }
-            // KASUS 2: Order BUY LIMIT kena -> Sekarang posisi BUY aktif.
-            // Respons EA: Pasang HANYA 1 SELL LIMIT di atas yang HANYA IKUT NAIK (tidak ikut turun).
+            // POSISI BUY AKTIF -> Pasang HANYA 1 Sell Limit di atas yang hanya boleh geser naik
             else if(dealType == DEAL_TYPE_BUY)
             {
                double targetPrice = NormalizeDouble(bid + (effectiveDist * point), digits);
-               trade.SellLimit(InpLotSize, targetPrice, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "Ratchet Sell Limit");
-               Print("[RATCHET LIMIT] Posisi BUY aktif -> Pasang HANYA 1 Sell Limit di ", targetPrice, " (hanya ikut naik)");
+               if(trade.SellLimit(lot, targetPrice, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "Ratchet Sell Limit"))
+               {
+                  Print("[ORDER RATCHET] Posisi BUY aktif -> Pasang Sell Limit di ", targetPrice, " (Hanya ikut naik)");
+               }
+               else
+               {
+                  Print("[GAGAL PASANG RATCHET SELL LIMIT] Retcode: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+               }
             }
          }
       }
@@ -470,17 +594,18 @@ void UpdateDashboard(double basketProfit, int layers, int pendings)
    
    string dashboard = "";
    dashboard += "=====================================================\n";
-   dashboard += "   RATCHET TRAILING LIMIT (SINGLE ORDER AI v3.1)    \n";
+   dashboard += "   RATCHET TRAILING LIMIT (SINGLE ORDER AI v3.2)    \n";
    dashboard += "=====================================================\n";
    dashboard += StringFormat("Symbol / Magic: %s / %d\n", _Symbol, InpMagicNumber);
-   dashboard += StringFormat("Posisi Aktif: %d / %d | Pending Aktif (Maks 1): %d\n", layers, InpMaxPositions, pendings);
+   dashboard += StringFormat("Posisi Aktif: %d / %d | Pending Aktif: %d\n", layers, InpMaxPositions, pendings);
    dashboard += StringFormat("Floating Basket Profit: $%.2f (Target: +$%.2f | Cut Loss: -$%.2f)\n", 
                              basketProfit, InpTargetProfitUSD, InpMaxDrawdownUSD);
    dashboard += "-----------------------------------------------------\n";
    dashboard += StringFormat("Kondisi Pasar (State): %s (State %d)\n", stateDesc, lastState);
    dashboard += StringFormat("Pengali ATR AI: %.2fx (Jarak Dinamis: %.0f points)\n", 
                              ActionMultipliers[lastAction], currentDynamicDistance);
-   dashboard += "Mode: Strictly Single Limit (Bukan Dua-duanya)\n";
+   dashboard += "-----------------------------------------------------\n";
+   dashboard += StringFormat("STATUS EA: %s\n", lastDiagnosisMsg);
    dashboard += "=====================================================\n";
 
    Comment(dashboard);
