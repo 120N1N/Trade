@@ -163,7 +163,7 @@ void CheckAndTradeCore()
       UpdateDashboard(0, 0, 0);
       return;
    }
-   if(!MqlInfoInteger(MQL_TRADE_ALLOWED))
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
    {
       lastDiagnosisMsg = "PERINGATAN: Opsi 'Allow Algo Trading' pada Tab Common EA belum dicentang! Tekan F7 di chart lalu centang.";
       UpdateDashboard(0, 0, 0);
